@@ -1,0 +1,67 @@
+#!/bin/sh
+
+pwd=$PWD
+script=$(readlink -f $0)
+script_dir=`dirname $script`
+
+hdf_file=$1
+if [ "$hdf_file" = "" ]; then
+    echo "Please specify HDF file."
+    exit 1
+fi
+
+board=$2
+if [ "$board" = "" ]; then
+    board=zcu102-es2
+fi
+
+hdf_file=$(readlink -f $hdf_file)
+hdf_file_name=$(basename $hdf_file)
+
+rm -rf hardware
+mkdir hardware
+cp $hdf_file hardware
+(cd hardware; unzip $hdf_file_name)
+
+if [ ! -d embeddedsw/.git ]; then
+    git clone --depth 1 https://github.com/shure/embeddedsw.git
+fi
+
+make -C embeddedsw/lib/sw_apps/zynqmp_fsbl/src BOARD=$board PROC=a53 A53_STATE=64 PSU_INIT_DIR=$pwd/hardware all
+
+if [ ! -d device-tree-xlnx/.git ]; then
+	git clone --depth 1 -b xilinx-v${PETALINUX_VER} https://github.com/Xilinx/device-tree-xlnx.git
+fi
+
+$script_dir/generate-device-tree $pwd/hardware/$hdf_file_name $pwd/device-tree-xlnx $pwd/hardware
+
+dtc -I dts -O dtb -o $pwd/hardware/system.dtb $pwd/hardware/system.dts
+
+if [ ! -d u-boot-xlnx/.git ]; then
+    git clone --depth 1 -b xilinx-v${PETALINUX_VER} https://github.com/Xilinx/u-boot-xlnx.git
+fi
+
+(export ARCH=arm64; export CROSS_COMPILE=aarch64-none-elf-; cd u-boot-xlnx; make xilinx_zynqmp_zcu102_defconfig; make -j 4)
+
+if [ ! -d arm-trusted-firmware/.git ]; then
+    git clone --depth 1 -b xilinx-v${PETALINUX_VER}  https://github.com/Xilinx/arm-trusted-firmware.git
+fi
+
+(export ARCH=arm64; export CROSS_COMPILE=aarch64-none-elf-; cd arm-trusted-firmware; make PLAT=zynqmp)
+
+fsbl_elf=$pwd/embeddedsw/lib/sw_apps/zynqmp_fsbl/src/fsbl.elf
+atf_elf=$pwd/arm-trusted-firmware/build/zynqmp/release/bl31/bl31.elf
+u_boot_elf=$pwd/u-boot-xlnx/u-boot.elf
+bit_stream=$pwd/hardware/design_1_wrapper.bit
+
+if [ ! -f dummy_project/config.project ]; then
+    petalinux-create -t project --template zynqMP -n dummy_project
+fi
+
+(cd dummy_project; petalinux-package --force --boot --atf $atf_elf --pmufw no --fsbl $fsbl_elf --fpga $bit_stream --u-boot $u_boot_elf)
+
+rm -rf out
+mkdir -p out
+cp dummy_project/BOOT.BIN hardware/system.dtb out
+
+ls -al out
